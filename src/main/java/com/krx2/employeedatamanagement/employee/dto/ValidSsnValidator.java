@@ -25,6 +25,8 @@ public class ValidSsnValidator implements ConstraintValidator<ValidSsn, String> 
         String group = matcher.group(2);
         String serial = matcher.group(3);
 
+        // Lexicographic comparison is safe here only because the regex above guarantees
+        // area is always exactly 3 digits, so "900" <= area <= "999" matches numerically too.
         boolean areaIsInvalid = area.equals("000") || area.equals("666") || area.compareTo("900") >= 0;
         boolean groupIsInvalid = group.equals("00");
         boolean serialIsInvalid = serial.equals("0000");

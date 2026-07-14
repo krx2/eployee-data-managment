@@ -141,13 +141,15 @@ Three secrets are required at startup, none defaulted, none committed — a miss
 | `APP_SSN_LOOKUP_PEPPER` | HMAC-SHA256 secret for the deterministic `ssn_lookup_hash` column, used only to detect duplicate SSNs (never to recover the value) |
 | `APP_API_KEY` | Shared secret every request must present via the `X-API-Key` header |
 
-**Authentication is intentionally minimal.** A servlet filter (`ApiKeyAuthFilter`) checks a single shared secret — enough to close "every endpoint is wide open" for this exercise, but not what a real deployment should use. In production this would be OAuth2 client-credentials between internal services, or mTLS at the service-mesh level, not an application-level shared secret.
+**Authentication is intentionally minimal.** A servlet filter (`ApiKeyAuthFilter`) checks a single shared secret via `MessageDigest.isEqual` (constant-time — a plain `String.equals` would leak timing information about how much of the key matched) — enough to close "every endpoint is wide open" for this exercise, but not what a real deployment should use. In production this would be OAuth2 client-credentials between internal services, or mTLS at the service-mesh level, not an application-level shared secret. The 401 response is a real `ProblemDetail`, serialized through the same `ObjectMapper` bean the rest of the app uses — the filter runs before `DispatcherServlet` so `@RestControllerAdvice` can't catch it, but that's no reason to hand-rebuild the error shape as a string literal.
 
 **SSN validation is semantic, not just syntactic.** Beyond the `XXX-XX-XXXX` shape, `@ValidSsn` enforces the SSA's structural rules: area ≠ `000`/`666`/`900`–`999`, group ≠ `00`, serial ≠ `0000`.
 
-**Duplicate SSNs are rejected**, not silently accepted. Every SSN is also stored as a deterministic HMAC (`ssn_lookup_hash`, unique-indexed) alongside the AES-GCM ciphertext used for the actual value — the hash is only ever used for the uniqueness check, never to recover the SSN itself. A second employee created with the same SSN gets `409 Conflict`.
+**Duplicate SSNs are rejected**, not silently accepted. Every SSN is also stored as a deterministic HMAC (`ssn_lookup_hash`, unique-indexed) alongside the AES-GCM ciphertext used for the actual value — the hash is only ever used for the uniqueness check, never to recover the SSN itself. `EmployeeService.create()` catches the resulting `DataIntegrityViolationException`, checks the violated constraint's *name* (not just "some integrity violation happened"), and only then throws a dedicated `DuplicateSsnException` → `409 Conflict`; any other, unrelated integrity violation still surfaces as a 500 instead of being misreported as a duplicate SSN.
 
 **The decrypted SSN never leaves the entity.** `Employee` exposes it only through a package-private `ssnForInternalUseOnly()`, callable solely by code in the same package (`EmployeeMapper`) — exposing it elsewhere requires a deliberate visibility change, not just an extra line of code.
+
+**Validation messages are pinned to English via a scoped bean, not a global JVM setting.** An earlier version of this fix called `Locale.setDefault(Locale.ENGLISH)` in a static initializer, which — while it worked — silently changed the default locale for the *entire JVM*, not just Bean Validation. It's now a dedicated `LocalValidatorFactoryBean` with a `MessageInterpolator` that always resolves messages in English, regardless of the host's locale, without touching anything else in the process.
 
 ## Technology choices and why
 
