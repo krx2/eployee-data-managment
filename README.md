@@ -5,58 +5,68 @@ A small backend microservice for storing and managing employee records for an in
 ## Tech stack
 
 - Java 25, Spring Boot 4.1 (Web MVC, Data JPA, Validation)
-- PostgreSQL 16 (via Docker Compose)
+- PostgreSQL 16 and the application itself, both via Docker Compose (multi-stage `Dockerfile`)
 - Flyway (versioned schema migrations)
 - AES-256-GCM (SSN encryption at rest)
 - JUnit 5, Mockito, AssertJ, Testcontainers
 
 ## Running locally
 
+The whole service — app and database — is containerized. **No local JDK is required** to run it; you only need Docker.
+
 ### Prerequisites
 
-- JDK 25
-- Docker Desktop (for the database, and for the Testcontainers-based integration test)
+- Docker Desktop
+- JDK 25 — only if you want to build/run/test outside Docker (e.g. from an IDE)
 
-### 1. Start the database
+### Option 1 — fully containerized (recommended)
+
+1. Provide an encryption key. Create a `.env` file in the project root (this file is gitignored, never committed):
+
+   ```bash
+   echo "APP_ENCRYPTION_KEY=$(openssl rand -base64 32)" > .env
+   ```
+
+   On Windows PowerShell:
+
+   ```powershell
+   "APP_ENCRYPTION_KEY=$([Convert]::ToBase64String((1..32 | ForEach-Object { Get-Random -Maximum 256 })))" | Out-File -Encoding utf8 .env
+   ```
+
+   Docker Compose reads `.env` automatically; the app container fails fast with a clear error if the variable isn't set — there is no insecure default.
+
+2. Build and start everything:
+
+   ```bash
+   docker compose up --build -d
+   ```
+
+   This builds the app image (multi-stage `Dockerfile`, JDK 25 for the build stage, slim JRE 25 for the runtime stage), starts `postgres:16-alpine`, waits for it to report healthy, then starts the app container. Flyway migrates the schema on startup.
+
+3. The API is available at `http://localhost:8080` on the host, exactly as if it were running locally.
+
+4. Tear down: `docker compose down` (add `-v` to also drop the database volume).
+
+### Option 2 — run the app locally against a containerized database
+
+Useful when you want to debug/step through the app in an IDE.
 
 ```bash
-docker compose up -d
-```
-
-This starts a `postgres:16-alpine` container on port `5432` with database/user/password all set to `employee_data`.
-
-### 2. Provide an encryption key
-
-The SSN encryption key is **not** committed to the repository and is not defaulted to anything weak — the app fails fast on startup if it's missing. Generate a random AES-256 key (32 bytes, base64-encoded) and export it:
-
-```bash
+docker compose up -d postgres
 export APP_ENCRYPTION_KEY=$(openssl rand -base64 32)
-```
-
-On Windows PowerShell:
-
-```powershell
-$env:APP_ENCRYPTION_KEY = [Convert]::ToBase64String((1..32 | ForEach-Object { Get-Random -Maximum 256 }))
-```
-
-If you're running the app from an IDE, set `APP_ENCRYPTION_KEY` as an environment variable on the run configuration instead.
-
-### 3. Run the application
-
-```bash
 ./mvnw spring-boot:run
 ```
 
-The API is available at `http://localhost:8080`.
+On Windows PowerShell, generate the key the same way as above and set it with `$env:APP_ENCRYPTION_KEY = "..."`. If running from an IDE run configuration, set `APP_ENCRYPTION_KEY` as an environment variable there instead.
 
-### 4. Run the tests
+### Running the tests
 
 ```bash
 export APP_ENCRYPTION_KEY=$(openssl rand -base64 32)
 ./mvnw test
 ```
 
-Most tests need the Docker Postgres container from step 1 running. The integration test (`EmployeeIntegrationTest`) additionally starts its **own** disposable Postgres container via Testcontainers, so Docker must be running for that test to pass — no other manual setup is required for it.
+This needs JDK 25 and Docker (not just the `postgres` container from Option 2, but Docker itself): most tests need a running Postgres — either the one from `docker compose up -d postgres`, or the integration test's **own** disposable container, which it starts automatically via Testcontainers.
 
 ## API
 
@@ -119,13 +129,22 @@ The key is read from an environment variable (`APP_ENCRYPTION_KEY`) and never co
 
 ## What I'd do differently with more time
 
-- **Key rotation.** The `key_version` column exists but nothing reads or acts on it yet; a real rotation flow (re-encrypt on read with an old key, write with the current one) is missing.
-- **Locale-independent validation messages.** Bean Validation's default messages are resolved against the JVM's default locale, which surfaced Polish validation messages in one of my manual test runs purely because of the host machine's locale. I'd pin `Locale.ROOT`/English explicitly (or make it content-negotiated) so API consumers get consistent messages regardless of where the service happens to run.
-- **Deterministic lookup support for the SSN**, if a real requirement ever needed "does this SSN already exist" without a full-table decrypt scan — an additional HMAC-SHA256(SSN, separate secret) column purely for equality lookups, alongside the AES-GCM ciphertext used for the value itself.
-- **Containerizing the app itself**, not just the database, so `docker compose up` alone (no local JDK) is enough to run the whole thing.
-- **CI** (GitHub Actions) running `mvn test` — the Testcontainers-based integration test is exactly the kind of thing that should run on every push, not just locally.
+This service went through a second pass after review feedback (see git history / `IMPLEMENTATION_PLAN.md`), which fixed a real bug (some malformed-input cases were returning 500 instead of 400) and closed several small gaps. What's below is what's still consciously left out, roughly in the order I'd tackle it:
+
+- **Authentication.** This is the biggest real gap for an "internal HR system" handling SSNs — every endpoint is open to anyone with network access. Deliberately out of scope here to keep the exercise focused on the data-handling requirements, but a real deployment needs at minimum a shared-secret gate (e.g. an `X-API-Key` header checked by a servlet filter) between services, and in production, OAuth2 client-credentials or mTLS at the service-mesh level rather than an application-level check at all.
+- **SSN validation is syntactic, not semantic.** The `@Pattern` only checks the `XXX-XX-XXXX` shape — `000-00-0000` or an area number in the invalid 900–999 range both pass today. A real system would enforce the SSA's structural rules (area ≠ 000/666/900-999, group ≠ 00, serial ≠ 0000) in a dedicated constraint, the same way `ReasonableDateOfBirth` is implemented.
+- **`Employee.getSsn()` is a plain public getter.** "SSN is never returned in plaintext" holds today only because the mapper is the only caller — nothing structurally prevents a future caller in a different layer from doing the wrong thing. I'd narrow its visibility to package-private and give it a name that makes misuse uncomfortable (e.g. `ssnForInternalUseOnly()`), so exposing it requires a deliberate visibility change, not just an extra line of code.
+- **Key rotation.** The `key_version` column exists but nothing reads or acts on it yet. Doing this properly runs into a real architectural constraint: a JPA `AttributeConverter` only ever sees the one column it's attached to, not sibling columns on the same row — so it can't itself consult `key_version` to pick a key. The correct minimal fix is to make the ciphertext self-describing (prefix the key version inside the encoded blob itself, alongside the nonce), and either repurpose or drop the `key_version` column in a follow-up migration once that lands.
+- **Duplicate-SSN detection.** There's no way today to tell that the same person has been entered twice — not even under the same exact SSN. The fix I'd implement: an additional `ssn_lookup_hash` column (HMAC-SHA256 of the SSN with a separate secret, deterministic, unlike the AES-GCM ciphertext used for the value itself), populated via a Spring-managed `@EntityListeners` `@PrePersist` callback (which does see the plaintext, unlike the converter), with a unique index and a `DataIntegrityViolationException` → 409 mapping in `GlobalExceptionHandler`.
+- **Audit logging.** Nothing today records who created or read a given employee record, which is a standard compliance expectation for a system holding SSNs. Meaningful "who" logging depends on auth landing first; in the meantime the access itself (action, employee id, timestamp) could already be logged through a dedicated logger so it's routable to a separate audit sink later without revisiting the call sites.
+- **Retention / erasure.** There's no `DELETE` endpoint and no retention policy, which a real HR system holding SSNs would need to reconcile against something like GDPR's right to erasure — and those two concerns can conflict (e.g. legally mandated payroll retention periods), which is worth a real policy decision, not just an endpoint.
+- **Locale-independent validation messages.** Bean Validation's default messages are resolved against the JVM's default locale, which surfaced Polish validation messages in one manual test run purely because of the host machine's locale. I'd pin `Locale.ROOT`/English explicitly so API consumers get consistent messages regardless of where the service happens to run.
+- **CI** (GitHub Actions) running `mvn test` on every push — the Testcontainers-based integration test is exactly the kind of thing that should run automatically, not just locally.
 - **OpenAPI/Swagger** documentation for the three endpoints.
 - **`@ConfigurationProperties`** instead of a raw `@Value` for the encryption key, mostly for testability/override convenience in more complex configurations.
+- **Confirming the repository is actually public on GitHub** before treating the assignment's "public GitHub repository" deliverable as satisfied — worth a final check before submission, not something a local working tree can confirm on its own.
+
+What's **not** on this list on purpose, because it's a reasonable simplification for the scope of a few-hours exercise rather than an oversight: no uniqueness constraint beyond the SSN-duplicate-detection idea above (two employees with different SSNs but identical names are fine), and the app-level container isn't hardened for production (no non-root user, no distroless base, no image scanning) — worth calling out explicitly rather than leaving unstated.
 
 ## AI tool usage
 

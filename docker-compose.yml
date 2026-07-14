@@ -9,6 +9,24 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U employee_data -d employee_data"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/employee_data
+      SPRING_DATASOURCE_USERNAME: employee_data
+      SPRING_DATASOURCE_PASSWORD: employee_data
+      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?APP_ENCRYPTION_KEY must be set in the host environment}
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
   postgres_data:
